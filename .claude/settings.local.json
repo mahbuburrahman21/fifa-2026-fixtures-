@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version)",
+      "PowerShell(node --version)",
+      "Bash(curl -s --max-time 30 \"https://fixturedownload.com/feed/json/fifa-world-cup-2026\")",
+      "mcp__Claude_Preview__preview_start",
+      "PowerShell(try { $m = Invoke-WebRequest \"http://localhost:8000/hls/demo-live/master.m3u8\" -UseBasicParsing -TimeoutSec 20; $txt=[Text.Encoding]::UTF8.GetString\\($m.Content\\); \"MASTER OK:\"; \\($txt -split \"`n\"\\)[0..5] -join \"`n\" } catch { \"MASTER FAILED: $_\" })",
+      "PowerShell(try { $r = Invoke-RestMethod \"https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=20260611-20260613\" -TimeoutSec 20; \"EVENTS: $\\($r.events.Count\\)\"; $r.events | ForEach-Object { \"$\\($_.id\\)  $\\($_.name\\)  status=$\\($_.status.type.state\\)/$\\($_.status.type.shortDetail\\)\" } } catch { \"ESPN scoreboard FAILED: $\\($_.Exception.Message\\)\" })"
+    ]
+  }
+}

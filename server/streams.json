@@ -1,0 +1,25 @@
+{
+  "_readme": [
+    "Add the HLS (.m3u8) streams YOU are authorized to use here.",
+    "Examples: your own OBS/ffmpeg encoder output, your TV provider's",
+    "authenticated stream URL, or a free-to-air broadcaster's stream.",
+    "Each entry: id (url-safe), name (shown in the player), url,",
+    "and optional 'headers' object (e.g. Referer/Authorization) and 'note'.",
+    "The two entries below are public TEST streams so you can verify the",
+    "player and relay work end-to-end."
+  ],
+  "streams": [
+    {
+      "id": "demo-live",
+      "name": "Demo: Unified Streaming live test",
+      "note": "Public live test stream — verifies live relay + prefetch",
+      "url": "https://demo.unified-streaming.com/k8s/live/stable/scte35.isml/.m3u8"
+    },
+    {
+      "id": "demo-vod",
+      "name": "Demo: Mux test stream (VOD)",
+      "note": "Public test stream — verifies the player",
+      "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    }
+  ]
+}
