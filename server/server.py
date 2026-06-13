@@ -608,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": msg}, code)
 
     def log_message(self, fmt, *args):  # quieter logs: only non-segment traffic
-        if "/seg/" not in (args[0] if args else ""):
+        if "/seg/" not in str(args[0] if args else ""):
             sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     # ---- routes ----
