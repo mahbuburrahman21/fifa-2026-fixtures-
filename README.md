@@ -1,8 +1,9 @@
-# ⚽ World Cup 2026 — Fixtures & Live Stream (Bangladesh Time)
+# ⚽ World Cup 2026 — Fixtures & Live Match Centre (Bangladesh Time)
 
 A FIFA World Cup 2026 match chart with **every kickoff converted to Bangladesh
-Standard Time (Asia/Dhaka, UTC+6)**, live scores, and a built-in HLS live
-video player backed by a Python stream-relay server.
+Standard Time (Asia/Dhaka, UTC+6)**, **real-time live scores on every card**, and
+a full Match Centre (timeline, lineups & formations, player ratings, match stats)
+plus a per-player card with photo, goals, assists and notable records.
 
 ## Quick start
 
@@ -18,63 +19,68 @@ or double-click `start.bat`, then open **http://localhost:8000**
 
 ```
 frontend/
-  index.html     React 18 + hls.js via CDN (no build step)
-  app.jsx        The whole React app (fixtures chart + video player)
+  index.html     React 18 via CDN (no build step)
+  app.jsx        The whole React app (fixtures chart + match centre + player card)
   styles.css     Dark glassy responsive theme
+  flags/         Locally bundled Twemoji flag PNGs (Windows has no flag font)
 server/
-  server.py      Python server: static files + fixtures API + HLS relay
-  streams.json   Your stream sources (HLS .m3u8 URLs)
+  server.py      Python server: static files + fixtures API + match centre API
   fixtures.json  Offline snapshot of all 104 fixtures (auto-updated)
+  matchdata/     Manual per-match overrides (created on demand)
 ```
 
 ## Features
 
 **Fixtures chart**
 - All 104 matches, grouped by Bangladesh calendar date with sticky day headers
-- Live BD clock, countdown to the next kickoff, LIVE badges + live scores
-  (auto-refreshes every 60 s from fixturedownload.com, falls back to the
-  offline snapshot when there's no internet)
-- Filters: team/venue search, stage, group A–L, live-only toggle, date rail
+- **Auto-scrolls to today's matches** on open (the date rail centres on today too)
+- **Real-time scores + live minute on each card** — polled every 20 s from
+  `/api/live`; upcoming matches show no score, live matches pulse with the
+  current minute, finished matches show FT with the winner highlighted
+- **View filter: All · Live · Upcoming · Results** — past matches are kept as
+  history (Results), today is the default landing point, future stays as-is
+- Live BD clock, countdown to the next kickoff
+- Filters: team/venue search, stage, group A–L, date rail
 - Fully responsive — one column on phones, grid on desktop
-
-**Video player**
-- HLS playback via hls.js (low-latency mode), Safari native fallback
-- Play/pause, volume, Go-Live, Picture-in-Picture, fullscreen,
-  buffer-health + quality readout
-- Source picker fed by `server/streams.json`, plus a custom-URL input
+- The whole card is clickable → opens the Match Centre
 
 **Match Centre (per-match live data)**
-- 📊 button on every match card opens the Match Centre with three tabs:
-  - **Overview** — minute-by-minute timeline: goals, cards, substitutions,
-    VAR, injuries, delays
-  - **Lineups** — starting XI drawn on a pitch in the real formation,
-    jersey numbers, sub in/out arrows with minutes, bench, and
-    color-coded player ratings
+- 📊 on every card opens the Match Centre with four tabs:
+  - **Overview** — a **win-prediction bar** (home/draw/away % from betting
+    moneylines, vig removed) plus the minute-by-minute timeline: goals,
+    cards, substitutions, VAR, injuries, delays
+  - **Lineups** — starting XI on a pitch in the real formation, jersey
+    numbers, **goal ⚽, assist 🅰 and yellow/red card markers next to each
+    player**, sub in/out arrows with minutes, bench, and colour-coded ratings
   - **Stats** — possession, shots, passes, corners, fouls, cards, saves…
-    as comparison bars
+    with the leading side highlighted and proportional (%) split bars
+  - **Standings** — the live group table (computed from results: MP, W, D, L,
+    GF, GA, GD, Pts) with the top-2 qualification places highlighted
 - Live matches auto-refresh every 10 s (60 s otherwise)
-- Data comes from ESPN's public API, auto-matched to fixtures by team
-  names + kickoff time; player ratings are computed from match stats
-  (goals, assists, shots on target, saves, cards, fouls…) and can be
-  overridden via the update API below
 
-**Python stream relay (`server.py`)**
-- Proxies the `.m3u8` playlists in `streams.json` and **prefetches upcoming
-  segments into an in-memory cache (96 MB LRU)** — the player downloads
-  from localhost instead of the remote origin, which removes most
-  rebuffering stalls
-- `/api/fixtures` — cached live feed + snapshot fallback
-- `/api/streams` — stream list for the player
-- `/hls/<id>/master.m3u8` — relayed, rewritten playlist
+**Player card**
+- Click any player (on the pitch or bench) to open a card with their **photo**
+  (ESPN headshot where available, jersey-number avatar otherwise), team flag,
+  position, **goals, assists, cards, rating**, a full stat breakdown, and
+  **notable records** (hat-trick, brace, multiple assists, clean sheet, star
+  performer, red card)
+
+Data comes from ESPN's public API, auto-matched to fixtures by team name +
+kickoff time. Player ratings are computed from match stats (goals, assists,
+shots on target, saves, cards, fouls…) and can be overridden via the API below.
 
 ## Match data API
 
 ```
-GET  /api/fixtures            all 104 fixtures + live scores
+GET  /api/fixtures            all 104 fixtures + scores (fixturedownload feed)
+GET  /api/live                compact real-time score + status for every match
+                              around "now" — one cached call, poll-friendly
 GET  /api/match/<n>           full match centre data for match number n:
-                              score, status/minute, events timeline,
-                              lineups + formation, subs in/out,
-                              player ratings, team stats
+                              score, status/minute, events timeline, win
+                              prediction (from odds), lineups + formation,
+                              subs in/out, per-player goals/assists/cards/
+                              photo/stats, ratings, team stats
+                              (group standings are computed client-side)
 POST /api/match/<n>/update    push your own real-time updates (JSON body);
                               stored in server/matchdata/<n>.json and
                               deep-merged over the live feed
@@ -109,41 +115,14 @@ update endpoint, set an environment variable before starting the server —
 `set WC_ADMIN_TOKEN=mysecret` — then send header `X-Admin-Token: mysecret`
 with every POST.
 
-## Adding your stream
-
-Edit `server/streams.json`:
-
-```json
-{
-  "streams": [
-    {
-      "id": "my-feed",
-      "name": "My broadcaster feed",
-      "url": "https://example.com/live/master.m3u8",
-      "headers": { "Referer": "https://example.com/" }
-    }
-  ]
-}
-```
-
-> **Note on legality:** this project does not find or scrape streams. Add only
-> streams you are authorized to use — your own OBS/ffmpeg encoder output, your
-> TV provider's authenticated stream, or a free-to-air broadcaster. The two
-> bundled entries are public *test* streams for verifying the player.
-
-### Streaming your own encoder (OBS / ffmpeg)
-
-Point ffmpeg at a folder and serve it as HLS, e.g.:
-
-```
-ffmpeg -i <input> -c:v h264 -c:a aac -f hls -hls_time 2 \
-       -hls_list_size 6 -hls_flags delete_segments live/master.m3u8
-```
-
-then set `"url": "http://<encoder-ip>/live/master.m3u8"` in streams.json.
-
 ## Options
 
 ```
 python server\server.py --port 9000 --host 127.0.0.1
 ```
+
+## Deploying (Render, free)
+
+The repo includes a `Dockerfile`. On Render: **New → Web Service → Docker**,
+branch `master`. The server reads the `PORT` env var via `--port $PORT` in the
+start command if you prefer the non-Docker path.

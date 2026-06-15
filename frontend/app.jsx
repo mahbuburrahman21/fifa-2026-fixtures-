@@ -1,8 +1,10 @@
 /* ============================================================
    World Cup 2026 — Fixtures in Bangladesh Time (React 18)
    - All kickoff times rendered in Asia/Dhaka (BST, UTC+6)
-   - Live scores auto-refresh from /api/fixtures every 60s
-   - HLS live player (hls.js) fed by the Python relay server
+   - Fixtures auto-refresh from /api/fixtures every 60s
+   - Real-time scores + status on cards via /api/live (every 20s)
+   - Match Centre: timeline, lineups/formation, stats, player ratings
+   - Player card: photo, goals/assists, stats and notable records
    ============================================================ */
 
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
@@ -137,15 +139,28 @@ function useFixtures() {
   return state;
 }
 
-function useStreams() {
-  const [streams, setStreams] = useState([]);
+/* Real-time score + status for every nearby match, in one poll.
+   Returns a map: matchNumber -> { score:{home,away}, status:{state,detail,clock} } */
+function useLiveScores() {
+  const [live, setLive] = useState({});
   useEffect(() => {
-    fetch("api/streams")
-      .then((r) => r.json())
-      .then((j) => setStreams(j.streams || []))
-      .catch(() => setStreams([]));
+    let timer, dead = false;
+    const tick = async () => {
+      try {
+        const res = await fetch("api/live");
+        const j = await res.json();
+        if (!dead) {
+          const map = {};
+          for (const m of j.matches || []) map[m.matchNumber] = m;
+          setLive(map);
+        }
+      } catch { /* keep last known */ }
+      if (!dead) timer = setTimeout(tick, 20_000);
+    };
+    tick();
+    return () => { dead = true; clearTimeout(timer); };
   }, []);
-  return streams;
+  return live;
 }
 
 /* ----------------------------- small components ----------------------------- */
@@ -206,32 +221,49 @@ function Countdown({ target, now }) {
 
 /* ----------------------------- match card ----------------------------- */
 
-function MatchCard({ m, now, finalMatchNo, onWatch, onCentre }) {
+function MatchCard({ m, now, finalMatchNo, live, onCentre }) {
   const stage = stageOf(m, finalMatchNo);
-  const status = matchStatus(m, now);
-  const live = status === "LIVE";
-  const done = status === "FT" || status === "FT?";
-  const home = prettyTeam(m.HomeTeam);
-  const away = prettyTeam(m.AwayTeam);
+  const ls = live && live.status ? live.status : null;
+  const timeStatus = matchStatus(m, now);
+
+  // live feed wins; otherwise fall back to time-based heuristics + feed
+  const isLive = ls ? ls.state === "in" : timeStatus === "LIVE";
+  const done = (ls ? ls.state === "post" : (timeStatus === "FT" || timeStatus === "FT?"))
+    || !!m.Winner;
+
+  // only show a scoreline for matches that are live or finished — the live
+  // feed reports 0-0 for not-yet-started matches, which we must ignore
+  const showScore = isLive || done;
+  const liveScore = live && live.score ? live.score : null;
+  const hs = showScore ? (liveScore && liveScore.home != null ? liveScore.home : m.HomeTeamScore) : null;
+  const as_ = showScore ? (liveScore && liveScore.away != null ? liveScore.away : m.AwayTeamScore) : null;
+  const hasScore = hs != null && as_ != null;
+
+  const homeWin = done && hasScore ? hs > as_ : m.Winner === m.HomeTeam;
+  const awayWin = done && hasScore ? as_ > hs : m.Winner === m.AwayTeam;
+  const minute = isLive ? ((ls && (ls.clock || ls.detail)) || "LIVE") : null;
 
   return (
     <article
       className={
-        "match-card" + (live ? " is-live" : "") + (stage.kind === "final" ? " is-final-match" : "")
+        "match-card" + (isLive ? " is-live" : "") + (stage.kind === "final" ? " is-final-match" : "")
       }
+      onClick={() => onCentre(m)}
+      role="button" tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onCentre(m)}
     >
       <div className="mc-top">
         <span className={"stage-pill " + (stage.kind === "final" ? "final-pill" : stage.kind)}>
           {stage.label}
         </span>
-        {live && <span className="status-pill live">● Live</span>}
-        {done && <span className="status-pill ft">FT</span>}
+        {isLive && <span className="status-pill live">● {minute}</span>}
+        {!isLive && done && <span className="status-pill ft">FT</span>}
         <span className="mc-no">#{m.MatchNumber}</span>
       </div>
 
       <div className="mc-teams">
-        <TeamRow team={m.HomeTeam} score={m.HomeTeamScore} isWinner={done && m.Winner === m.HomeTeam} />
-        <TeamRow team={m.AwayTeam} score={m.AwayTeamScore} isWinner={done && m.Winner === m.AwayTeam} />
+        <TeamRow team={m.HomeTeam} score={hs} isWinner={homeWin} />
+        <TeamRow team={m.AwayTeam} score={as_} isWinner={awayWin} />
       </div>
 
       <div className="mc-bottom">
@@ -244,224 +276,10 @@ function MatchCard({ m, now, finalMatchNo, onWatch, onCentre }) {
         </div>
       </div>
 
-      <div className="card-actions">
-        <button
-          className={"watch-btn" + (live ? " hot" : "")}
-          onClick={() => onWatch(m, { home: home.label, away: away.label, live })}
-        >
-          {live ? "▶ Watch live" : done ? "▶ Open player" : "▶ Player / preview"}
-        </button>
-        <button className="watch-btn" onClick={() => onCentre(m)}>
-          📊 Match centre
-        </button>
-      </div>
+      <button className="centre-btn" onClick={(e) => { e.stopPropagation(); onCentre(m); }}>
+        📊 Match centre
+      </button>
     </article>
-  );
-}
-
-/* ----------------------------- video player ----------------------------- */
-
-function VideoPlayer({ match, streams, onClose }) {
-  const videoRef = useRef(null);
-  const hlsRef = useRef(null);
-  const [sourceId, setSourceId] = useState(streams[0] ? streams[0].id : "custom");
-  const [customUrl, setCustomUrl] = useState("");
-  const [phase, setPhase] = useState("idle"); // idle | loading | playing | error
-  const [errMsg, setErrMsg] = useState("");
-  const [muted, setMuted] = useState(false);
-  const [paused, setPaused] = useState(false);
-  const [volume, setVolume] = useState(1);
-  const [bufferAhead, setBufferAhead] = useState(0);
-  const [levelInfo, setLevelInfo] = useState("");
-
-  const srcUrl = useMemo(() => {
-    if (sourceId === "custom") return customUrl.trim();
-    return `hls/${sourceId}/master.m3u8`; // relayed + prefetched by the Python server
-  }, [sourceId, customUrl]);
-
-  const destroy = () => {
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
-  };
-
-  const start = useCallback(() => {
-    const video = videoRef.current;
-    if (!video || !srcUrl) return;
-    destroy();
-    setPhase("loading");
-    setErrMsg("");
-
-    if (window.Hls && Hls.isSupported()) {
-      const hls = new Hls({
-        lowLatencyMode: true,
-        liveSyncDurationCount: 3,
-        maxBufferLength: 30,
-        backBufferLength: 30,
-        enableWorker: true,
-      });
-      hlsRef.current = hls;
-      hls.loadSource(srcUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch(() => {});
-        setPhase("playing");
-      });
-      hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
-        const lvl = hls.levels[data.level];
-        if (lvl) setLevelInfo(`${lvl.height ? lvl.height + "p" : ""} ${Math.round(lvl.bitrate / 1000)} kbps`);
-      });
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else {
-          setPhase("error");
-          setErrMsg(`Stream error: ${data.details || data.type}`);
-          destroy();
-        }
-      });
-    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = srcUrl; // Safari native HLS
-      video.play().then(() => setPhase("playing")).catch(() => setPhase("error"));
-    } else {
-      setPhase("error");
-      setErrMsg("This browser cannot play HLS streams.");
-    }
-  }, [srcUrl]);
-
-  useEffect(() => {
-    start();
-    return destroy;
-  }, [start]);
-
-  // buffer health meter
-  useEffect(() => {
-    const id = setInterval(() => {
-      const v = videoRef.current;
-      if (!v || !v.buffered.length) return setBufferAhead(0);
-      const end = v.buffered.end(v.buffered.length - 1);
-      setBufferAhead(Math.max(0, end - v.currentTime));
-    }, 500);
-    return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const v = () => videoRef.current;
-  const togglePlay = () => {
-    if (!v()) return;
-    if (v().paused) { v().play(); setPaused(false); } else { v().pause(); setPaused(true); }
-  };
-  const goLive = () => {
-    const hls = hlsRef.current;
-    if (hls && hls.liveSyncPosition != null) v().currentTime = hls.liveSyncPosition;
-    else if (v() && isFinite(v().duration)) v().currentTime = v().duration - 1;
-    v() && v().play();
-    setPaused(false);
-  };
-  const togglePip = async () => {
-    try {
-      if (document.pictureInPictureElement) await document.exitPictureInPicture();
-      else if (v()) await v().requestPictureInPicture();
-    } catch { /* PiP unsupported */ }
-  };
-  const fullscreen = () => {
-    const el = v();
-    if (!el) return;
-    if (document.fullscreenElement) document.exitFullscreen();
-    else (el.requestFullscreen || el.webkitEnterFullscreen || (() => {})).call(el);
-  };
-  const setVol = (val) => {
-    setVolume(val);
-    if (v()) { v().volume = val; v().muted = val === 0; setMuted(val === 0); }
-  };
-
-  const title = `${prettyTeam(match.HomeTeam).label} vs ${prettyTeam(match.AwayTeam).label}`;
-
-  return (
-    <div className="modal-veil" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="player-card" role="dialog" aria-label={`Video player: ${title}`}>
-        <div className="player-head">
-          <Flag team={match.HomeTeam} />
-          <div>
-            <div className="title">{title}</div>
-            <div className="sub">
-              {fmtDateLong.format(match.date)} · {fmtTime.format(match.date)} BD time · {venuePretty(match.Location)}
-            </div>
-          </div>
-          <Flag team={match.AwayTeam} />
-          <button className="close-btn" onClick={onClose} aria-label="Close player">✕</button>
-        </div>
-
-        <div className="video-wrap">
-          <video ref={videoRef} playsInline muted={muted} />
-          {phase === "loading" && (
-            <div className="video-overlay-msg"><div className="spinner" /> Connecting to stream…</div>
-          )}
-          {phase === "error" && (
-            <div className="video-overlay-msg">
-              <div style={{ fontSize: 30 }}>📡</div>
-              <div>{errMsg || "Could not load this stream."}</div>
-              <div style={{ fontSize: 12, color: "var(--text-2)" }}>
-                Pick another source below, or add your licensed stream URL to server/streams.json.
-              </div>
-            </div>
-          )}
-          {phase === "idle" && !srcUrl && (
-            <div className="video-overlay-msg">Select a stream source below to start playback.</div>
-          )}
-        </div>
-
-        <div className="player-controls">
-          <button className="pc-btn" onClick={togglePlay}>{paused ? "▶ Play" : "⏸ Pause"}</button>
-          <button className="pc-btn golive" onClick={goLive}>● Go Live</button>
-          <span className="vol">
-            <button className="pc-btn" onClick={() => setVol(muted ? 1 : 0)}>{muted ? "🔇" : "🔊"}</button>
-            <input
-              type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume}
-              onChange={(e) => setVol(parseFloat(e.target.value))} aria-label="Volume"
-            />
-          </span>
-          <span className="pc-spacer" />
-          <span className="buffer-meter">
-            buffer <b>{bufferAhead.toFixed(1)}s</b>{levelInfo ? ` · ${levelInfo}` : ""}
-          </span>
-          <button className="pc-btn" onClick={togglePip}>⧉ PiP</button>
-          <button className="pc-btn" onClick={fullscreen}>⛶ Fullscreen</button>
-        </div>
-
-        <div className="source-row">
-          <select
-            className="ctrl" value={sourceId}
-            onChange={(e) => setSourceId(e.target.value)} aria-label="Stream source"
-          >
-            {streams.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-            <option value="custom">Custom HLS URL…</option>
-          </select>
-          {sourceId === "custom" && (
-            <React.Fragment>
-              <input
-                placeholder="https://…/playlist.m3u8 (a stream you are licensed to use)"
-                value={customUrl} onChange={(e) => setCustomUrl(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && start()}
-              />
-              <button className="pc-btn" onClick={start}>Load</button>
-            </React.Fragment>
-          )}
-        </div>
-        <p className="legal-note">
-          Streams are relayed through your local Python server with segment prefetching for
-          smooth playback. Only play streams you are authorized to use (your own encoder,
-          your TV provider, or a free-to-air broadcaster).
-        </p>
-      </div>
-    </div>
   );
 }
 
@@ -531,21 +349,38 @@ function formationRows(lineup) {
   return [gk, ...rows];
 }
 
-function PlayerChip({ p, subMinutes }) {
-  const lastName = (p.shortName || p.name).split(" ").slice(-1)[0] || p.name;
+/* goal / assist / card markers shown next to a player */
+function GAflags({ p }) {
+  if (!p.goals && !p.assists && !p.yellow && !p.red) return null;
   return (
-    <div className="pchip" title={`${p.name} · ${p.position}${p.rating != null ? " · rating " + p.rating : ""}`}>
-      <div className="pchip-circle">
-        {p.jersey || "–"}
-        <RatingBadge rating={p.rating} />
-        {p.subbedOut && <span className="sub-arrow out">▼{subMinutes[p.name] || ""}</span>}
-      </div>
-      <div className="pchip-name">{lastName}</div>
-    </div>
+    <span className="ga-flags">
+      {p.goals > 0 && <span className="ga g" title={`${p.goals} goal(s)`}>⚽{p.goals > 1 ? p.goals : ""}</span>}
+      {p.assists > 0 && <span className="ga a" title={`${p.assists} assist(s)`}>👟{p.assists > 1 ? p.assists : ""}</span>}
+      {p.yellow > 0 && <span className="ga yc" title="Yellow card" />}
+      {p.red > 0 && <span className="ga rc" title="Red card" />}
+    </span>
   );
 }
 
-function TeamPitch({ lineup, subMinutes }) {
+function PlayerChip({ p, subMinutes, onPlayer }) {
+  const lastName = (p.shortName || p.name).split(" ").slice(-1)[0] || p.name;
+  return (
+    <button
+      className="pchip" onClick={() => onPlayer(p)}
+      title={`${p.name} · ${p.position}${p.rating != null ? " · rating " + p.rating : ""} — click for details`}
+    >
+      <div className="pchip-circle">
+        {p.jersey || "–"}
+        <RatingBadge rating={p.rating} />
+        <GAflags p={p} />
+        {p.subbedOut && <span className="sub-arrow out">▼{subMinutes[p.name] || ""}</span>}
+      </div>
+      <div className="pchip-name">{lastName}</div>
+    </button>
+  );
+}
+
+function TeamPitch({ lineup, subMinutes, onPlayer }) {
   const rows = formationRows(lineup).slice().reverse(); // attack on top
   const rated = [...(lineup.starters || []), ...(lineup.subs || [])]
     .map((p) => p.rating).filter((r) => r != null);
@@ -560,26 +395,131 @@ function TeamPitch({ lineup, subMinutes }) {
       <div className="pitch">
         {rows.map((row, i) => (
           <div className="pitch-row" key={i}>
-            {row.map((p) => <PlayerChip key={p.name} p={p} subMinutes={subMinutes} />)}
+            {row.map((p) => <PlayerChip key={p.name} p={p} subMinutes={subMinutes} onPlayer={onPlayer} />)}
           </div>
         ))}
       </div>
       <div className="bench">
         <div className="bench-title">Bench</div>
         {(lineup.subs || []).filter((p) => p.subbedIn).map((p) => (
-          <div className="bench-row" key={p.name}>
+          <button className="bench-row" key={p.name} onClick={() => onPlayer(p)}>
             <span className="sub-arrow in">▲{subMinutes[p.name] || ""}</span>
             <span className="bench-name">{p.name}</span>
+            <GAflags p={p} />
             <span className="bench-pos">{p.position !== "SUB" ? p.position : ""}</span>
             <RatingBadge rating={p.rating} />
-          </div>
+          </button>
         ))}
         {(lineup.subs || []).filter((p) => !p.subbedIn).slice(0, 8).map((p) => (
-          <div className="bench-row unused" key={p.name}>
+          <button className="bench-row unused" key={p.name} onClick={() => onPlayer(p)}>
             <span className="bench-name">{p.name}</span>
             <span className="bench-pos">unused</span>
-          </div>
+          </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------- player card ----------------------------- */
+
+const PLAYER_STAT_ROWS = [
+  ["G", "Goals", true], ["A", "Assists", true],
+  ["SHOT", "Shots", true], ["SOG", "On target", true],
+  ["FC", "Fouls", false], ["FA", "Fouls won", false],
+  ["OF", "Offsides", false], ["YC", "Yellow cards", false],
+  ["RC", "Red cards", false], ["SV", "Saves", false],
+  ["GA", "Goals conceded", false],
+];
+
+function playerRecords(p) {
+  const out = [];
+  const s = p.stats || {};
+  const n = (k) => Number(s[k] || 0);
+  if (p.goals >= 3) out.push("⚽ Hat-trick!");
+  else if (p.goals === 2) out.push("⚽ Brace");
+  if (p.assists >= 2) out.push(`🅰 ${p.assists} assists`);
+  if (p.position === "G" && n("APP") >= 1 && n("GA") === 0) out.push("🧤 Clean sheet");
+  if (n("SV") >= 5) out.push(`🧤 ${n("SV")} saves`);
+  if (p.rating != null && p.rating >= 8.5) out.push("⭐ Star performer");
+  if (n("RC") >= 1) out.push("🟥 Sent off");
+  return out;
+}
+
+function PlayerCard({ player, teamName, flagTeam, onClose }) {
+  const [noPhoto, setNoPhoto] = useState(false);
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const s = player.stats || {};
+  const records = playerRecords(player);
+  const rows = PLAYER_STAT_ROWS.filter(([k, , always]) =>
+    always || Number(s[k] || 0) > 0);
+
+  return (
+    <div className="modal-veil player-veil" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="pcard" role="dialog" aria-label={`Player: ${player.name}`}>
+        <button className="close-btn pcard-close" onClick={onClose} aria-label="Close">✕</button>
+
+        <div className="pcard-hero">
+          <div className="pcard-photo">
+            {player.photo && !noPhoto ? (
+              <img src={player.photo} alt={player.name} onError={() => setNoPhoto(true)} />
+            ) : (
+              <div className="pcard-avatar">{player.jersey || "?"}</div>
+            )}
+            {player.rating != null && (
+              <span className={"pcard-rating " + ratingClass(player.rating)}>
+                {player.rating.toFixed(1)}
+              </span>
+            )}
+          </div>
+          <div className="pcard-id">
+            <div className="pcard-name">{player.name}</div>
+            <div className="pcard-meta">
+              <Flag team={flagTeam} /> {teamName}
+              <span className="dot-sep">•</span> #{player.jersey || "—"}
+              <span className="dot-sep">•</span> {player.position || "—"}
+              {player.subbedIn && <span className="pcard-tag in">▲ sub</span>}
+              {player.subbedOut && <span className="pcard-tag out">▼ subbed off</span>}
+            </div>
+          </div>
+        </div>
+
+        {records.length > 0 && (
+          <div className="pcard-records">
+            {records.map((r) => <span className="record-chip" key={r}>{r}</span>)}
+          </div>
+        )}
+
+        <div className="pcard-headline">
+          <div className="ph-cell"><b>{player.goals || 0}</b><span>Goals</span></div>
+          <div className="ph-cell"><b>{player.assists || 0}</b><span>Assists</span></div>
+          <div className="ph-cell">
+            <b>{player.rating != null ? player.rating.toFixed(1) : "–"}</b><span>Rating</span>
+          </div>
+        </div>
+
+        {rows.length > 0 ? (
+          <div className="pcard-stats">
+            {rows.map(([k, label]) => (
+              <div className="ps-row" key={k}>
+                <span className="ps-label">{label}</span>
+                <span className="ps-val">{Number(s[k] || 0)}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="centre-empty" style={{ padding: "24px 12px" }}>
+            No detailed stats recorded yet.
+          </div>
+        )}
+        <p className="legal-note" style={{ paddingTop: 4 }}>
+          Player photo from ESPN (where available) · stats &amp; rating from the Match Centre feed.
+        </p>
       </div>
     </div>
   );
@@ -589,25 +529,142 @@ function StatBar({ s }) {
   const hv = parseFloat(String(s.home).replace("%", "")) || 0;
   const av = parseFloat(String(s.away).replace("%", "")) || 0;
   const total = hv + av;
-  const hw = total ? (hv / total) * 100 : 50;
+  const hPct = total ? Math.round((hv / total) * 100) : 50;
+  const homeLead = hv > av, awayLead = av > hv;
   return (
     <div className="stat-row">
       <div className="stat-vals">
-        <span className={hv >= av ? "lead" : ""}>{s.home}</span>
+        <span className={"stat-pill home" + (homeLead ? " lead" : "")}>{s.home}</span>
         <span className="stat-label">{s.label}</span>
-        <span className={av >= hv ? "lead" : ""}>{s.away}</span>
+        <span className={"stat-pill away" + (awayLead ? " lead" : "")}>{s.away}</span>
       </div>
-      <div className="stat-bar">
-        <div className="stat-bar-home" style={{ width: hw + "%" }} />
-        <div className="stat-bar-away" style={{ width: (100 - hw) + "%" }} />
+      <div className="stat-bars">
+        <div className="stat-track home">
+          <div className="stat-fill home" style={{ width: hPct + "%" }} />
+        </div>
+        <div className="stat-track away">
+          <div className="stat-fill away" style={{ width: (100 - hPct) + "%" }} />
+        </div>
       </div>
     </div>
   );
 }
 
-function MatchCentre({ match, onClose }) {
+/* ----------------------------- prediction bar ----------------------------- */
+
+function PredictionBar({ prediction, homeTeam, awayTeam }) {
+  if (!prediction) return null;
+  const { home = 0, draw = 0, away = 0 } = prediction;
+  const tot = home + draw + away || 1;
+  const h = (home / tot) * 100, d = (draw / tot) * 100, a = (away / tot) * 100;
+  return (
+    <div className="prediction">
+      <div className="pred-title">
+        Win prediction <span className="pred-src">· {prediction.source || "model"}</span>
+      </div>
+      <div className="pred-bar">
+        <div className="pred-seg home" style={{ width: h + "%" }}>{Math.round(h)}%</div>
+        <div className="pred-seg draw" style={{ width: d + "%" }}>{Math.round(d)}%</div>
+        <div className="pred-seg away" style={{ width: a + "%" }}>{Math.round(a)}%</div>
+      </div>
+      <div className="pred-legend">
+        <span><i className="dotc home" /> {prettyTeam(homeTeam).label}</span>
+        <span><i className="dotc draw" /> Draw</span>
+        <span><i className="dotc away" /> {prettyTeam(awayTeam).label}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------- group standings ----------------------------- */
+
+/* compute a group table from the fixtures of one group (finished matches only) */
+function computeStandings(allMatches, group) {
+  if (!group) return null;
+  const rows = {};
+  const row = (team) => (rows[team] = rows[team] ||
+    { team, MP: 0, W: 0, D: 0, L: 0, GF: 0, GA: 0, Pts: 0, form: [] });
+  for (const m of allMatches) {
+    if (m.Group !== group) continue;
+    if (m.HomeTeamScore == null || m.AwayTeamScore == null) continue; // not played
+    const h = row(m.HomeTeam), a = row(m.AwayTeam);
+    const hs = m.HomeTeamScore, as_ = m.AwayTeamScore;
+    h.MP++; a.MP++; h.GF += hs; h.GA += as_; a.GF += as_; a.GA += hs;
+    if (hs > as_) { h.W++; a.L++; h.Pts += 3; h.form.push("W"); a.form.push("L"); }
+    else if (hs < as_) { a.W++; h.L++; a.Pts += 3; a.form.push("W"); h.form.push("L"); }
+    else { h.D++; a.D++; h.Pts++; a.Pts++; h.form.push("D"); a.form.push("D"); }
+  }
+  const list = Object.values(rows).map((r) => ({ ...r, GD: r.GF - r.GA }));
+  if (!list.length) return null;
+  list.sort((x, y) => y.Pts - x.Pts || y.GD - x.GD || y.GF - x.GF
+    || prettyTeam(x.team).label.localeCompare(prettyTeam(y.team).label));
+  return list;
+}
+
+/* last-5 form: newest on the right, padded with empty circles to 5 */
+function FormDots({ form }) {
+  const last = (form || []).slice(-5);
+  const cells = [];
+  for (let i = 0; i < 5; i++) {
+    const r = last[i];
+    const cls = r === "W" ? "win" : r === "D" ? "draw" : r === "L" ? "loss" : "none";
+    const mark = r === "W" ? "✓" : r === "D" ? "–" : r === "L" ? "✕" : "";
+    cells.push(<i key={i} className={"form-dot " + cls}>{mark}</i>);
+  }
+  return <span className="form-dots">{cells}</span>;
+}
+
+function Standings({ table, group }) {
+  if (!table) {
+    return <div className="centre-empty">The group table appears once matches have been played.</div>;
+  }
+  return (
+    <div className="standings">
+      <div className="stand-group">{group}</div>
+      <table className="stand-table">
+        <thead>
+          <tr>
+            <th className="s-pos">#</th><th className="s-team">Team</th>
+            <th>MP</th><th>W</th><th>D</th><th>L</th>
+            <th className="s-hide">GF</th><th className="s-hide">GA</th>
+            <th>GD</th><th className="s-pts">Pts</th>
+            <th className="s-form">Last 5</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table.map((r, i) => (
+            <tr key={r.team} className={i < 2 ? "qualify" : ""}>
+              <td className="s-pos">{i + 1}</td>
+              <td className="s-team"><Flag team={r.team} /> <span>{prettyTeam(r.team).label}</span></td>
+              <td>{r.MP}</td><td>{r.W}</td><td>{r.D}</td><td>{r.L}</td>
+              <td className="s-hide">{r.GF}</td><td className="s-hide">{r.GA}</td>
+              <td>{r.GD > 0 ? "+" + r.GD : r.GD}</td>
+              <td className="s-pts">{r.Pts}</td>
+              <td className="s-form"><FormDots form={r.form} /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="stand-legend">
+        <span><i className="form-dot win">✓</i> Win</span>
+        <span><i className="form-dot draw">–</i> Draw</span>
+        <span><i className="form-dot loss">✕</i> Loss</span>
+        <span><i className="form-dot none" /> Not played</span>
+      </div>
+      <div className="stand-note"><i className="qual-dot" /> Top 2 advance to the knockout stage</div>
+    </div>
+  );
+}
+
+function MatchCentre({ match, allMatches, onClose }) {
   const { data, err } = useMatchCentre(match.MatchNumber);
   const [tab, setTab] = useState("overview");
+  const [player, setPlayer] = useState(null); // { player, teamName, flagTeam }
+
+  const standings = useMemo(
+    () => computeStandings(allMatches || [], match.Group),
+    [allMatches, match.Group]
+  );
 
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
@@ -632,6 +689,7 @@ function MatchCentre({ match, onClose }) {
   const hasScore = score && score.home != null;
 
   return (
+    <React.Fragment>
     <div className="modal-veil" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="player-card centre-card" role="dialog" aria-label={`Match centre: ${home.label} vs ${away.label}`}>
         <div className="player-head">
@@ -655,7 +713,8 @@ function MatchCentre({ match, onClose }) {
         </div>
 
         <div className="centre-tabs">
-          {[["overview", "Overview"], ["lineups", "Lineups"], ["stats", "Stats"]].map(([id, label]) => (
+          {[["overview", "Overview"], ["lineups", "Lineups"], ["stats", "Stats"],
+            ...(match.Group ? [["standings", "Standings"]] : [])].map(([id, label]) => (
             <button key={id} className={"tab-btn" + (tab === id ? " active" : "")} onClick={() => setTab(id)}>
               {label}
             </button>
@@ -667,31 +726,43 @@ function MatchCentre({ match, onClose }) {
           {err && !data && <div className="centre-empty">Could not load match data: {err}</div>}
 
           {data && tab === "overview" && (
-            data.events.length ? (
-              <div className="timeline">
-                {data.events.map((ev, i) => (
-                  <div className="tl-row" key={i}>
-                    <span className="tl-min">{ev.minute || "—"}</span>
-                    <span className="tl-icon">{eventIcon(ev.type)}</span>
-                    <span className="tl-text">
-                      {ev.text || [ev.type, ev.players.join(", "), ev.team && `(${ev.team})`]
-                        .filter(Boolean).join(" — ")}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="centre-empty">
-                No match events yet — the timeline appears once the match goes live.
-              </div>
-            )
+            <React.Fragment>
+              <PredictionBar
+                prediction={data.prediction}
+                homeTeam={match.HomeTeam} awayTeam={match.AwayTeam}
+              />
+              {data.events.length ? (
+                <div className="timeline">
+                  {data.events.map((ev, i) => (
+                    <div className="tl-row" key={i}>
+                      <span className="tl-min">{ev.minute || "—"}</span>
+                      <span className="tl-icon">{eventIcon(ev.type)}</span>
+                      <span className="tl-text">
+                        {ev.text || [ev.type, ev.players.join(", "), ev.team && `(${ev.team})`]
+                          .filter(Boolean).join(" — ")}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="centre-empty">
+                  No match events yet — the timeline appears once the match goes live.
+                </div>
+              )}
+            </React.Fragment>
           )}
 
           {data && tab === "lineups" && (
             data.lineups ? (
               <div className="pitches">
-                <TeamPitch lineup={data.lineups.home} subMinutes={subMinutes} />
-                <TeamPitch lineup={data.lineups.away} subMinutes={subMinutes} />
+                <TeamPitch
+                  lineup={data.lineups.home} subMinutes={subMinutes}
+                  onPlayer={(p) => setPlayer({ player: p, teamName: data.lineups.home.team, flagTeam: match.HomeTeam })}
+                />
+                <TeamPitch
+                  lineup={data.lineups.away} subMinutes={subMinutes}
+                  onPlayer={(p) => setPlayer({ player: p, teamName: data.lineups.away.team, flagTeam: match.AwayTeam })}
+                />
               </div>
             ) : (
               <div className="centre-empty">Lineups are usually announced ~1 hour before kickoff.</div>
@@ -705,6 +776,10 @@ function MatchCentre({ match, onClose }) {
               <div className="centre-empty">Match stats appear once the match kicks off.</div>
             )
           )}
+
+          {tab === "standings" && (
+            <Standings table={standings} group={match.Group} />
+          )}
         </div>
 
         {data && (
@@ -717,6 +792,13 @@ function MatchCentre({ match, onClose }) {
         )}
       </div>
     </div>
+    {player && (
+      <PlayerCard
+        player={player.player} teamName={player.teamName}
+        flagTeam={player.flagTeam} onClose={() => setPlayer(null)}
+      />
+    )}
+    </React.Fragment>
   );
 }
 
@@ -724,18 +806,39 @@ function MatchCentre({ match, onClose }) {
 
 function App() {
   const { matches, source, error } = useFixtures();
-  const streams = useStreams();
+  const live = useLiveScores();
   const now = useNow(1000);
 
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("all");
   const [groupFilter, setGroupFilter] = useState("all");
-  const [liveOnly, setLiveOnly] = useState(false);
+  const [viewMode, setViewMode] = useState("all"); // all | live | upcoming | results
   const [selectedDate, setSelectedDate] = useState("all");
-  const [watching, setWatching] = useState(null);
   const [centre, setCentre] = useState(null);
 
+  const todayRef = useRef(null);
+  const railRef = useRef(null);
+  const todayChipRef = useRef(null);
+  const scrolledRef = useRef(false);
+
   const todayKey = bdKey(new Date(now));
+
+  // match phase: "live" | "done" | "upcoming" — live feed wins, else heuristic
+  const phaseOf = useCallback(
+    (m) => {
+      const l = live[m.MatchNumber];
+      const st = l && l.status ? l.status.state : null;
+      if (st === "in") return "live";
+      if (st === "post") return "done";
+      if (st === "pre") return "upcoming";
+      const ts = matchStatus(m, now);
+      if (ts === "LIVE") return "live";
+      if (ts === "FT" || ts === "FT?" || m.Winner) return "done";
+      return "upcoming";
+    },
+    [live, now]
+  );
+  const isLiveMatch = useCallback((m) => phaseOf(m) === "live", [phaseOf]);
   const finalMatchNo = useMemo(
     () => (matches ? Math.max(...matches.map((m) => m.MatchNumber)) : -1),
     [matches]
@@ -750,7 +853,10 @@ function App() {
       if (stageFilter === "group" && !m.Group) return false;
       if (stageFilter !== "all" && stageFilter !== "group" && String(m.RoundNumber) !== stageFilter)
         return false;
-      if (liveOnly && matchStatus(m, now) !== "LIVE") return false;
+      if (viewMode !== "all") {
+        const want = viewMode === "results" ? "done" : viewMode;
+        if (phaseOf(m) !== want) return false;
+      }
       if (q) {
         const hay = [
           m.HomeTeam, m.AwayTeam, prettyTeam(m.HomeTeam).label, prettyTeam(m.AwayTeam).label,
@@ -761,7 +867,7 @@ function App() {
       if (selectedDate !== "all" && bdKey(m.date) !== selectedDate) return false;
       return true;
     });
-  }, [matches, search, stageFilter, groupFilter, liveOnly, selectedDate, now]);
+  }, [matches, search, stageFilter, groupFilter, viewMode, selectedDate, now, phaseOf]);
 
   /* ---- group by Bangladesh date ---- */
   const byDay = useMemo(() => {
@@ -785,9 +891,35 @@ function App() {
   }, [matches]);
 
   const liveMatches = useMemo(
-    () => (matches || []).filter((m) => matchStatus(m, now) === "LIVE"),
-    [matches, now]
+    () => (matches || []).filter((m) => isLiveMatch(m)),
+    [matches, isLiveMatch]
   );
+
+  // which day to auto-scroll to: today if it has matches, else the next day
+  const scrollKey = useMemo(() => {
+    const keys = byDay.map(([k]) => k);
+    if (keys.includes(todayKey)) return todayKey;
+    return keys.find((k) => k >= todayKey) || null;
+  }, [byDay, todayKey]);
+
+  // auto-scroll to today's fixtures once, after first load
+  useEffect(() => {
+    if (matches && !scrolledRef.current && todayRef.current) {
+      scrolledRef.current = true;
+      setTimeout(() => {
+        todayRef.current && todayRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 350);
+    }
+  }, [matches, scrollKey]);
+
+  // center the today chip in the date rail
+  useEffect(() => {
+    if (matches && railRef.current && todayChipRef.current) {
+      const rail = railRef.current, chip = todayChipRef.current;
+      rail.scrollLeft += chip.getBoundingClientRect().left - rail.getBoundingClientRect().left - 120;
+    }
+  }, [matches]);
+
   const nextMatch = useMemo(
     () => (matches || []).find((m) => m.date.getTime() > now),
     [matches, now]
@@ -845,13 +977,16 @@ function App() {
                 <span className="status-pill live" style={{ padding: "2px 8px" }}>●</span>
                 {liveMatches.length} match{liveMatches.length > 1 ? "es" : ""} LIVE now
               </span>
-              <button
-                className="watch-btn hot"
-                onClick={() => setWatching(liveMatches[0])}
-              >
-                ▶ Watch {prettyTeam(liveMatches[0].HomeTeam).label} vs{" "}
-                {prettyTeam(liveMatches[0].AwayTeam).label}
-              </button>
+              {liveMatches.slice(0, 1).map((lm) => {
+                const l = live[lm.MatchNumber];
+                const sc = l && l.score && l.score.home != null
+                  ? `${l.score.home}–${l.score.away}` : "vs";
+                return (
+                  <button key={lm.MatchNumber} className="watch-btn hot" onClick={() => setCentre(lm)}>
+                    📊 {prettyTeam(lm.HomeTeam).label} {sc} {prettyTeam(lm.AwayTeam).label}
+                  </button>
+                );
+              })}
             </div>
           ) : nextMatch ? (
             <div className="next-kickoff">
@@ -895,18 +1030,22 @@ function App() {
               <option key={g} value={`Group ${g}`}>Group {g}</option>
             ))}
           </select>
-          <span
-            className={"toggle-live" + (liveOnly ? " on" : "")}
-            onClick={() => setLiveOnly(!liveOnly)}
-            role="switch" aria-checked={liveOnly} tabIndex={0}
-            onKeyDown={(e) => e.key === "Enter" && setLiveOnly(!liveOnly)}
-          >
-            ● Live only
-          </span>
+          <div className="view-seg" role="tablist" aria-label="Filter by match phase">
+            {[["all", "All"], ["live", "● Live"], ["upcoming", "Upcoming"], ["results", "Results"]]
+              .map(([id, label]) => (
+                <button
+                  key={id} role="tab" aria-selected={viewMode === id}
+                  className={"seg-btn" + (viewMode === id ? " active" : "") + (id === "live" ? " live" : "")}
+                  onClick={() => setViewMode(id)}
+                >
+                  {label}
+                </button>
+              ))}
+          </div>
         </div>
 
         {/* ---------- date rail ---------- */}
-        <div className="date-rail" role="tablist" aria-label="Match days (Bangladesh dates)">
+        <div className="date-rail" role="tablist" ref={railRef} aria-label="Match days (Bangladesh dates)">
           <div
             className={"date-chip" + (selectedDate === "all" ? " active" : "")}
             onClick={() => setSelectedDate("all")} role="tab"
@@ -916,6 +1055,7 @@ function App() {
           {allDays.map(([key, d]) => (
             <div
               key={key}
+              ref={key === todayKey ? todayChipRef : null}
               className={
                 "date-chip" + (selectedDate === key ? " active" : "") +
                 (key === todayKey ? " today-mark" : "")
@@ -932,7 +1072,7 @@ function App() {
         <div className="feed-note">
           <span className={"dot" + (source === "live" ? "" : " stale")} />
           {source === "live"
-            ? "Live data · scores refresh every 60s · times shown in Bangladesh Standard Time"
+            ? "Live scores update in real time · times shown in Bangladesh Standard Time"
             : "Offline snapshot · connect to the internet for live scores"}
         </div>
 
@@ -944,7 +1084,10 @@ function App() {
           </div>
         )}
         {byDay.map(([key, dayMatches]) => (
-          <section className="day-section" key={key}>
+          <section
+            className="day-section" key={key}
+            ref={key === scrollKey ? todayRef : null}
+          >
             <div className="day-head">
               <h2>{fmtDateLong.format(dayMatches[0].date)}</h2>
               {key === todayKey && <span className="today-tag">Today</span>}
@@ -954,7 +1097,7 @@ function App() {
               {dayMatches.map((m) => (
                 <MatchCard
                   key={m.MatchNumber} m={m} now={now}
-                  finalMatchNo={finalMatchNo} onWatch={() => setWatching(m)}
+                  finalMatchNo={finalMatchNo} live={live[m.MatchNumber]}
                   onCentre={() => setCentre(m)}
                 />
               ))}
@@ -965,17 +1108,14 @@ function App() {
         <footer className="footer">
           <span>
             FIFA World Cup 2026 · 11 June – 19 July · fixtures via fixturedownload.com ·
-            all times in Bangladesh Standard Time (UTC+6)
+            live data via ESPN · all times in Bangladesh Standard Time (UTC+6)
           </span>
-          <span>Built with React + hls.js + a Python stream relay 🇧🇩</span>
+          <span>Built with React + a Python match-centre API 🇧🇩</span>
         </footer>
       </main>
 
-      {watching && (
-        <VideoPlayer match={watching} streams={streams} onClose={() => setWatching(null)} />
-      )}
       {centre && (
-        <MatchCentre match={centre} onClose={() => setCentre(null)} />
+        <MatchCentre match={centre} allMatches={matches} onClose={() => setCentre(null)} />
       )}
     </React.Fragment>
   );

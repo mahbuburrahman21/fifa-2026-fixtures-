@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FIFA World Cup 2026 — Fixtures + Live Stream Relay Server
+FIFA World Cup 2026 — Fixtures + Live Match Centre Server
 =========================================================
 
 A zero-dependency (Python stdlib only) server that:
@@ -9,18 +9,14 @@ A zero-dependency (Python stdlib only) server that:
   2. Proxies the live fixtures feed (fixturedownload.com) with a short
      TTL cache, and keeps an offline snapshot in fixtures.json so the
      site still works without internet.
-  3. Relays HLS (.m3u8) live streams listed in streams.json through a
-     local proxy that PREFETCHES upcoming media segments into an
-     in-memory cache. The player then pulls segments from localhost
-     at LAN speed instead of waiting on the remote origin — which is
-     what eliminates most rebuffering.
-
-IMPORTANT — legality note:
-  This server does not scrape or "find" streams. It only relays HLS
-  URLs that YOU put in streams.json — i.e. streams you are licensed
-  or authorized to use (your own encoder/OBS output, your TV
-  provider's authenticated stream, a free-to-air broadcaster, or the
-  demo test streams shipped in streams.json).
+  3. Exposes a Match Centre API backed by ESPN's public soccer API:
+     real-time scores, match status/minute, event timeline, lineups +
+     formations, substitutions, per-player goals/assists/stats and
+     computed player ratings. All of it can be overridden manually
+     through POST /api/match/<n>/update (stored in server/matchdata/).
+  4. Exposes /api/live — one cached call returning live score + status
+     for every in-progress match, so the fixture cards update in real
+     time without hammering the upstream API.
 
 Usage:
   python server.py [--port 8000] [--host 0.0.0.0]
@@ -29,7 +25,6 @@ Then open http://localhost:8000
 """
 
 import argparse
-import base64
 import copy
 import json
 import mimetypes
@@ -41,14 +36,12 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(os.path.dirname(ROOT), "frontend")
 FIXTURES_SNAPSHOT = os.path.join(ROOT, "fixtures.json")
-STREAMS_FILE = os.path.join(ROOT, "streams.json")
 MATCHDATA_DIR = os.path.join(ROOT, "matchdata")
 
 # Optional write-protection for the manual update API:
@@ -58,10 +51,8 @@ ADMIN_TOKEN = os.environ.get("WC_ADMIN_TOKEN", "")
 FEED_URL = "https://fixturedownload.com/feed/json/fifa-world-cup-2026"
 FEED_TTL = 60          # seconds between live re-fetches (scores update live)
 HTTP_TIMEOUT = 15      # upstream request timeout
-SEGMENT_CACHE_MB = 96  # in-memory segment cache budget
-PREFETCH_SEGMENTS = 4  # how many of the newest segments to prefetch
 
-USER_AGENT = "Mozilla/5.0 (WC2026-Relay/1.0)"
+USER_AGENT = "Mozilla/5.0 (WC2026-MatchCentre/2.0)"
 
 
 # --------------------------------------------------------------------------
@@ -73,15 +64,6 @@ def http_get(url, headers=None, timeout=HTTP_TIMEOUT):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read(), resp.geturl(), resp.headers.get("Content-Type", "")
-
-
-def b64e(url: str) -> str:
-    return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
-
-
-def b64d(token: str) -> str:
-    pad = "=" * (-len(token) % 4)
-    return base64.urlsafe_b64decode(token + pad).decode("utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -132,160 +114,6 @@ class FixtureStore:
                 return json.load(f)
         except Exception:
             return None
-
-
-# --------------------------------------------------------------------------
-# HLS relay with prefetching segment cache
-# --------------------------------------------------------------------------
-
-class SegmentCache:
-    """Thread-safe LRU byte cache."""
-
-    def __init__(self, budget_bytes):
-        self._lock = threading.Lock()
-        self._items = OrderedDict()   # url -> (bytes, content_type)
-        self._size = 0
-        self._budget = budget_bytes
-
-    def get(self, url):
-        with self._lock:
-            item = self._items.get(url)
-            if item:
-                self._items.move_to_end(url)
-            return item
-
-    def put(self, url, body, ctype):
-        with self._lock:
-            if url in self._items:
-                return
-            self._items[url] = (body, ctype)
-            self._size += len(body)
-            while self._size > self._budget and self._items:
-                _, (old, _) = self._items.popitem(last=False)
-                self._size -= len(old)
-
-    def __contains__(self, url):
-        with self._lock:
-            return url in self._items
-
-
-class HlsRelay:
-    def __init__(self):
-        self.cache = SegmentCache(SEGMENT_CACHE_MB * 1024 * 1024)
-        self._inflight = set()
-        self._inflight_lock = threading.Lock()
-
-    # -- streams.json ------------------------------------------------------
-
-    def load_streams(self):
-        try:
-            with open(STREAMS_FILE, encoding="utf-8") as f:
-                cfg = json.load(f)
-            return [s for s in cfg.get("streams", []) if s.get("id") and s.get("url")]
-        except Exception as exc:
-            print(f"[streams] cannot read streams.json: {exc}", file=sys.stderr)
-            return []
-
-    def stream_by_id(self, sid):
-        for s in self.load_streams():
-            if s["id"] == sid:
-                return s
-        return None
-
-    # -- playlist rewriting --------------------------------------------------
-
-    def rewrite_playlist(self, text, base_url, sid):
-        out = []
-        next_is_variant = False
-        for line in text.splitlines():
-            s = line.strip()
-            if not s:
-                out.append(line)
-                continue
-            if s.startswith("#"):
-                line = re.sub(
-                    r'URI="([^"]+)"',
-                    lambda m: 'URI="%s"' % self._proxy_path(m.group(1), base_url, sid, "seg"),
-                    line,
-                )
-                out.append(line)
-                if s.startswith("#EXT-X-STREAM-INF"):
-                    next_is_variant = True
-                continue
-            is_playlist = next_is_variant or s.split("?")[0].lower().endswith(".m3u8")
-            next_is_variant = False
-            out.append(self._proxy_path(s, base_url, sid, "pl" if is_playlist else "seg"))
-        return ("\n".join(out) + "\n").encode("utf-8")
-
-    @staticmethod
-    def _proxy_path(uri, base_url, sid, kind):
-        absolute = urllib.parse.urljoin(base_url, uri)
-        return f"/hls/{sid}/{kind}/{b64e(absolute)}"
-
-    # -- prefetching ---------------------------------------------------------
-
-    def prefetch_from_playlist(self, text, base_url, headers):
-        """Warm the cache with the newest media segments of a live playlist."""
-        if "#EXTINF" not in text:
-            return
-        segs = [
-            urllib.parse.urljoin(base_url, line.strip())
-            for line in text.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        for url in segs[-PREFETCH_SEGMENTS:]:
-            if url in self.cache:
-                continue
-            with self._inflight_lock:
-                if url in self._inflight:
-                    continue
-                self._inflight.add(url)
-            threading.Thread(target=self._fetch_into_cache, args=(url, headers), daemon=True).start()
-
-    def _fetch_into_cache(self, url, headers):
-        try:
-            body, _, ctype = http_get(url, headers)
-            self.cache.put(url, body, ctype or "video/mp2t")
-        except Exception:
-            pass
-        finally:
-            with self._inflight_lock:
-                self._inflight.discard(url)
-
-    # -- request entrypoints ---------------------------------------------------
-
-    def serve_master(self, sid):
-        stream = self.stream_by_id(sid)
-        if not stream:
-            return None
-        headers = stream.get("headers") or {}
-        body, final_url, _ = http_get(stream["url"], headers)
-        text = body.decode("utf-8", "replace")
-        self.prefetch_from_playlist(text, final_url, headers)
-        return self.rewrite_playlist(text, final_url, sid)
-
-    def serve_playlist(self, sid, token):
-        stream = self.stream_by_id(sid)
-        if not stream:
-            return None
-        headers = stream.get("headers") or {}
-        url = b64d(token)
-        body, final_url, _ = http_get(url, headers)
-        text = body.decode("utf-8", "replace")
-        self.prefetch_from_playlist(text, final_url, headers)
-        return self.rewrite_playlist(text, final_url, sid)
-
-    def serve_segment(self, sid, token):
-        url = b64d(token)
-        cached = self.cache.get(url)
-        if cached:
-            return cached
-        stream = self.stream_by_id(sid)
-        headers = (stream.get("headers") if stream else None) or {}
-        body, _, ctype = http_get(url, headers)
-        ctype = ctype or "video/mp2t"
-        self.cache.put(url, body, ctype)
-        return body, ctype
 
 
 # --------------------------------------------------------------------------
@@ -363,6 +191,35 @@ def compute_rating(stats):
     return round(min(10.0, max(4.0, score)), 1)
 
 
+def _ml_to_prob(ml):
+    """American moneyline -> implied probability (0..1)."""
+    try:
+        ml = float(ml)
+    except (TypeError, ValueError):
+        return None
+    return (-ml / (-ml + 100.0)) if ml < 0 else (100.0 / (ml + 100.0))
+
+
+def prediction_from_odds(odds_list):
+    """Build a home/draw/away win-probability split from betting moneylines,
+    with the bookmaker margin (vig) removed by normalising to 100%."""
+    if not odds_list:
+        return None
+    o = odds_list[0]
+    h = _ml_to_prob((o.get("homeTeamOdds") or {}).get("moneyLine"))
+    d = _ml_to_prob((o.get("drawOdds") or {}).get("moneyLine"))
+    a = _ml_to_prob((o.get("awayTeamOdds") or {}).get("moneyLine"))
+    if None in (h, d, a) or (h + d + a) <= 0:
+        return None
+    tot = h + d + a
+    return {
+        "home": round(h / tot * 100),
+        "draw": round(d / tot * 100),
+        "away": round(a / tot * 100),
+        "source": (o.get("provider") or {}).get("name", "betting odds"),
+    }
+
+
 class MatchCenter:
     def __init__(self, fixture_store):
         self.fixtures = fixture_store
@@ -370,6 +227,7 @@ class MatchCenter:
         self._eids = {}        # MatchNumber -> espn event id
         self._summaries = {}   # eid -> (fetched_at, ttl, normalized)
         self._boards = {}      # dates-str -> (fetched_at, events)
+        self._live_board = None  # (dates-str, fetched_at, events) for /api/live
         os.makedirs(MATCHDATA_DIR, exist_ok=True)
 
     # ---- public ----
@@ -388,7 +246,7 @@ class MatchCenter:
             "score": {"home": fixture.get("HomeTeamScore"),
                       "away": fixture.get("AwayTeamScore")},
             "status": {"state": "pre", "detail": "Scheduled", "clock": ""},
-            "events": [], "lineups": None, "stats": [],
+            "events": [], "lineups": None, "stats": [], "prediction": None,
             "source": "fixtures",
         }
         espn = self._espn_data(fixture)
@@ -409,6 +267,76 @@ class MatchCenter:
             data["source"] += "+manual"
         data["fetchedAt"] = time.time()
         return data
+
+    def live_scores(self):
+        """Compact live score + status for every match around 'now'.
+
+        One short-TTL-cached upstream scoreboard call, matched to fixtures
+        by team name. Safe to poll frequently from the fixture cards.
+        """
+        fixtures, _ = self.fixtures.get()
+        if not fixtures:
+            return []
+        now = datetime.now(timezone.utc)
+        dates = "{}-{}".format((now - timedelta(days=1)).strftime("%Y%m%d"),
+                               (now + timedelta(days=1)).strftime("%Y%m%d"))
+        with self._lock:
+            cached = self._live_board
+        if not cached or cached[0] != dates or time.time() - cached[1] > 20:
+            try:
+                body, _, _ = http_get(ESPN_SCOREBOARD.format(dates=dates))
+                events = json.loads(body).get("events", [])
+            except Exception as exc:
+                print(f"[live] scoreboard fetch failed: {exc}", file=sys.stderr)
+                events = cached[2] if cached else []
+            with self._lock:
+                self._live_board = (dates, time.time(), events)
+        else:
+            events = cached[2]
+
+        # index ESPN events by frozenset of normalized team names, with
+        # scores keyed by team name (robust to home/away flips between feeds)
+        by_teams = {}
+        for ev in events:
+            comp = ev.get("competitions", [{}])[0]
+            status = comp.get("status", {})
+            comps = comp.get("competitors", [])
+            names = frozenset(norm_name(c.get("team", {}).get("displayName", ""))
+                              for c in comps)
+            score_by_name = {}
+            for c in comps:
+                v = c.get("score")
+                score_by_name[norm_name(c.get("team", {}).get("displayName", ""))] = (
+                    int(v) if v not in (None, "") else None)
+            by_teams[names] = {
+                "scoreByName": score_by_name,
+                "status": {
+                    "state": (status.get("type") or {}).get("state", "pre"),
+                    "detail": (status.get("type") or {}).get("detail", ""),
+                    "clock": status.get("displayClock", ""),
+                },
+            }
+
+        lo, hi = now - timedelta(days=1), now + timedelta(days=1)
+        out = []
+        for m in fixtures:
+            try:
+                ko = datetime.strptime(m["DateUtc"], "%Y-%m-%d %H:%M:%SZ").replace(
+                    tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if not (lo <= ko <= hi):
+                continue
+            hit = by_teams.get(frozenset({norm_name(m["HomeTeam"]),
+                                          norm_name(m["AwayTeam"])}))
+            if hit:
+                out.append({
+                    "matchNumber": m["MatchNumber"],
+                    "score": {"home": hit["scoreByName"].get(norm_name(m["HomeTeam"])),
+                              "away": hit["scoreByName"].get(norm_name(m["AwayTeam"]))},
+                    "status": hit["status"],
+                })
+        return out
 
     def save_override(self, match_no, body):
         path = os.path.join(MATCHDATA_DIR, f"{match_no}.json")
@@ -522,15 +450,26 @@ class MatchCenter:
                 for entry in r.get("roster", []):
                     stats = {st.get("abbreviation"): st.get("value", 0)
                              for st in entry.get("stats", [])}
+                    athlete = entry.get("athlete", {})
+                    aid = str(athlete.get("id", "") or "")
                     player = {
-                        "name": entry.get("athlete", {}).get("displayName", ""),
-                        "shortName": entry.get("athlete", {}).get("shortName", ""),
+                        "id": aid,
+                        "name": athlete.get("displayName", ""),
+                        "shortName": athlete.get("shortName", ""),
+                        # ESPN headshot CDN; many WC players lack one, so the
+                        # frontend falls back to a jersey avatar on 404.
+                        "photo": (f"https://a.espncdn.com/i/headshots/soccer/"
+                                  f"players/full/{aid}.png" if aid else ""),
                         "jersey": entry.get("jersey", ""),
                         "position": (entry.get("position") or {}).get("abbreviation", ""),
                         "place": entry.get("formationPlace", 0),
                         "starter": entry.get("starter", False),
                         "subbedIn": bool(entry.get("subbedIn")),
                         "subbedOut": bool(entry.get("subbedOut")),
+                        "goals": int(float(stats.get("G", 0) or 0)),
+                        "assists": int(float(stats.get("A", 0) or 0)),
+                        "yellow": int(float(stats.get("YC", 0) or 0)),
+                        "red": int(float(stats.get("RC", 0) or 0)),
                         "stats": stats,
                         "rating": compute_rating(stats),
                     }
@@ -566,6 +505,7 @@ class MatchCenter:
             "events": events,
             "lineups": lineups,
             "stats": stats,
+            "prediction": prediction_from_odds(s.get("odds")),
         }
 
 
@@ -574,10 +514,8 @@ class MatchCenter:
 # --------------------------------------------------------------------------
 
 fixtures = FixtureStore()
-relay = HlsRelay()
 matchcenter = MatchCenter(fixtures)
 
-HLS_RE = re.compile(r"^/hls/([\w.-]+)/(master\.m3u8|pl/([\w-]+)|seg/([\w-]+))$")
 MATCH_RE = re.compile(r"^/api/match/(\d+)$")
 MATCH_UPDATE_RE = re.compile(r"^/api/match/(\d+)/update$")
 
@@ -622,10 +560,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(503, "fixtures unavailable (no internet, no snapshot)")
                 return self._json({"source": source, "fetchedAt": time.time(), "matches": data})
 
-            if path == "/api/streams":
-                streams = [{k: s[k] for k in ("id", "name", "note") if k in s}
-                           for s in relay.load_streams()]
-                return self._json({"streams": streams})
+            if path == "/api/live":
+                return self._json({"fetchedAt": time.time(),
+                                   "matches": matchcenter.live_scores()})
 
             m = MATCH_RE.match(path)
             if m:
@@ -634,15 +571,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(404, "unknown match number")
                 return self._json(data)
 
-            m = HLS_RE.match(path)
-            if m:
-                return self._serve_hls(m)
-
             return self._serve_static(path)
         except urllib.error.HTTPError as exc:
             self._error(exc.code, f"upstream error: {exc}")
         except Exception as exc:
-            self._error(502, f"relay error: {exc}")
+            self._error(502, f"server error: {exc}")
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
@@ -673,21 +606,6 @@ class Handler(BaseHTTPRequestHandler):
                            "override": override,
                            "merged": matchcenter.get(match_no)})
 
-    def _serve_hls(self, m):
-        sid, rest = m.group(1), m.group(2)
-        if rest == "master.m3u8":
-            body = relay.serve_master(sid)
-            if body is None:
-                return self._error(404, f"unknown stream id '{sid}'")
-            return self._send(200, body, "application/vnd.apple.mpegurl")
-        if rest.startswith("pl/"):
-            body = relay.serve_playlist(sid, m.group(3))
-            if body is None:
-                return self._error(404, f"unknown stream id '{sid}'")
-            return self._send(200, body, "application/vnd.apple.mpegurl")
-        body, ctype = relay.serve_segment(sid, m.group(4))
-        return self._send(200, body, ctype, cache="max-age=60")
-
     def _serve_static(self, path):
         if path in ("", "/"):
             path = "/index.html"
@@ -706,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WC2026 fixtures + HLS relay server")
+    parser = argparse.ArgumentParser(description="WC2026 fixtures + match centre server")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
@@ -718,8 +636,8 @@ def main():
     print(f"  World Cup 2026 server running:")
     print(f"  ->  http://localhost:{args.port}")
     print(f"  Fixtures feed : {FEED_URL}")
-    print(f"  Streams file  : {STREAMS_FILE}")
-    print(f"  Segment cache : {SEGMENT_CACHE_MB} MB, prefetch {PREFETCH_SEGMENTS} segments")
+    print(f"  Match centre  : ESPN public API (live scores, lineups, stats)")
+    print(f"  Admin token   : {'set' if ADMIN_TOKEN else 'not set (updates open)'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
