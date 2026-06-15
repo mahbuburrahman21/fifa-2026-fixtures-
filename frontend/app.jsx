@@ -812,7 +812,7 @@ function App() {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("all");
   const [groupFilter, setGroupFilter] = useState("all");
-  const [viewMode, setViewMode] = useState("all"); // all | live | upcoming | results
+  const [viewMode, setViewMode] = useState("current"); // current | live | history | all
   const [selectedDate, setSelectedDate] = useState("all");
   const [centre, setCentre] = useState(null);
 
@@ -853,9 +853,12 @@ function App() {
       if (stageFilter === "group" && !m.Group) return false;
       if (stageFilter !== "all" && stageFilter !== "group" && String(m.RoundNumber) !== stageFilter)
         return false;
-      if (viewMode !== "all") {
-        const want = viewMode === "results" ? "done" : viewMode;
-        if (phaseOf(m) !== want) return false;
+      const dayKey = bdKey(m.date);
+      if (viewMode === "live" && phaseOf(m) !== "live") return false;
+      // current/history split by day — but a picked date overrides it
+      if (selectedDate === "all") {
+        if (viewMode === "current" && dayKey < todayKey) return false;   // today + upcoming
+        if (viewMode === "history" && dayKey >= todayKey) return false;  // previous days only
       }
       if (q) {
         const hay = [
@@ -867,7 +870,7 @@ function App() {
       if (selectedDate !== "all" && bdKey(m.date) !== selectedDate) return false;
       return true;
     });
-  }, [matches, search, stageFilter, groupFilter, viewMode, selectedDate, now, phaseOf]);
+  }, [matches, search, stageFilter, groupFilter, viewMode, selectedDate, now, todayKey, phaseOf]);
 
   /* ---- group by Bangladesh date ---- */
   const byDay = useMemo(() => {
@@ -1031,7 +1034,7 @@ function App() {
             ))}
           </select>
           <div className="view-seg" role="tablist" aria-label="Filter by match phase">
-            {[["all", "All"], ["live", "● Live"], ["upcoming", "Upcoming"], ["results", "Results"]]
+            {[["current", "Today & Next"], ["live", "● Live"], ["history", "History"], ["all", "All"]]
               .map(([id, label]) => (
                 <button
                   key={id} role="tab" aria-selected={viewMode === id}
